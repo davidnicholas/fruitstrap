@@ -59,6 +59,7 @@ import plistlib
 import socket
 import subprocess
 import sys
+import struct
 import time
 
 # CoreFoundation.framework
@@ -349,6 +350,39 @@ AMDeviceLookupApplications = MobileDevice.AMDeviceLookupApplications
 AMDeviceLookupApplications.argtypes = [am_device_p, ctypes.c_uint, ctypes.POINTER(CFDictionaryRef)]
 AMDeviceLookupApplications.restype = ctypes.c_uint
 
+# AFC
+
+AFCConnectionRef = ctypes.c_void_p
+AFCFileRef = ctypes.c_uint64
+
+AFCConnectionOpen = MobileDevice.AFCConnectionOpen
+AFCConnectionOpen.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.POINTER(AFCConnectionRef)]
+AFCConnectionOpen.restype = ctypes.c_uint
+
+AFCConnectionClose = MobileDevice.AFCConnectionClose
+AFCConnectionClose.argtypes = [AFCConnectionRef]
+AFCConnectionClose.restype = ctypes.c_uint
+
+AFCFileRefOpen = MobileDevice.AFCFileRefOpen
+AFCFileRefOpen.argtypes = [AFCConnectionRef, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(AFCFileRef)]
+AFCFileRefOpen.restype = ctypes.c_uint
+
+AFCFileRefRead = MobileDevice.AFCFileRefRead
+AFCFileRefRead.argtypes = [AFCConnectionRef, AFCFileRef, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+AFCFileRefRead.restype = ctypes.c_uint
+
+AFCFileRefWrite = MobileDevice.AFCFileRefWrite
+AFCFileRefWrite.argtypes = [AFCConnectionRef, AFCFileRef, ctypes.c_void_p, ctypes.c_uint]
+AFCFileRefWrite.restype = ctypes.c_uint
+
+AFCFileRefClose = MobileDevice.AFCFileRefClose
+AFCFileRefClose.argtypes = [AFCConnectionRef, AFCFileRef]
+AFCFileRefClose.restype = ctypes.c_uint
+
+AFCDirectoryCreate = MobileDevice.AFCDirectoryCreate
+AFCDirectoryCreate.argtypes = [AFCConnectionRef, ctypes.c_char_p]
+AFCDirectoryCreate.restype = ctypes.c_uint
+
 # ws2_32.dll
 
 if sys.platform == 'win32':
@@ -414,6 +448,26 @@ if sys.platform == 'win32':
             e = socket_setsockopt(self._socket, SOL_SOCKET, SO_RCVTIMEO, ctypes.byref(value), 4)
             if e != 0:
                 raise RuntimeError('setsockopt returned %d' % e)
+
+class RawPlistService(object):
+    def __init__(self, service):
+        if sys.platform == 'win32':
+            self._socket = MockSocket(service)
+        else:
+            self._socket = socket.fromfd(service, socket.AF_INET, socket.SOCK_STREAM)
+
+    def close(self):
+        self._socket.close()
+
+    def exchange(self, data):
+        payload = plistlib.writePlistToString(data).encode('utf-8')
+        message = struct.pack('>i', len(payload)) + payload
+        self._socket.sendall(message)
+
+        header = self._socket.recv(4)
+        size = struct.unpack('>i', header)[0]
+        payload = self._socket.recv(size)
+        return plistlib.readPlistFromString(payload)
 
 # Finally, the good stuff.
 
@@ -524,31 +578,67 @@ class MobileDeviceManager(object):
         return CFStringGetStr(AMDeviceCopyDeviceIdentifier(self._device))
 
     def mountImage(self, imagePath):
-        self.connect()
-        try:
-            self.startSession()
+        if sys.platform == 'win32':
+            # AMDeviceMountImage isn't exported in MobileDevice.dll grumble grumble.
+            service = self.startService('com.apple.afc')
             try:
-                signature = open(imagePath + '.signature', 'rb').read()
-                signature = CFDataCreate(None, signature, len(signature))
-                items = 2
-
-                keys = (ctypes.c_void_p * items)(CFStr('ImageSignature'), CFStr('ImageType'))
-                values = (ctypes.c_void_p * items)(signature, CFStr('Developer'))
-
-                options = CFDictionaryCreate(None, keys, values, items, ctypes.byref(kCFTypeDictionaryKeyCallBacks), ctypes.byref(kCFTypeDictionaryValueCallBacks))
-                self._mountCallback = am_device_mount_image_callback(self._mount)
-                e = AMDeviceMountImage(self._device, CFStr(imagePath), options, self._mountCallback, None)
-                if e == 0:
-                    return True
-                elif e  == 0xe8000076:
-                    # already mounted
-                    return False
-                else:
-                    raise RuntimeError('AMDeviceMountImage returned %d' % e)
+                afc = AFC(service)
+                try:
+                    afc.mkdir('PublicStaging')
+                    target = afc.open('PublicStaging/staging.dimage', 'w')
+                    with open(imagePath, 'rb') as source:
+                        while True:
+                            data = source.read(8192)
+                            if data:
+                                target.write(data)
+                            else:
+                                break
+                    target.close()
+                finally:
+                    afc.close()
             finally:
-                self.stopSession()
-        finally:
-            self.disconnect()
+                self.stopService(service)
+            service = self.startService('com.apple.mobile.mobile_image_mounter')
+            try:
+                raw = RawPlistService(service)
+                result = raw.exchange({
+                    'Command': 'MountImage',
+                    'ImageType': 'Developer',
+                    'ImageSignature': plistlib.Data(open(imagePath + '.signature', 'rb').read()),
+                    'ImagePath': '/private/var/mobile/Media/PublicStaging/staging.dimage',
+                })
+                if 'Error' in result:
+                    print 'MountImage returned', result['Error']
+                if 'Status' in result:
+                    print 'MountImage =>', result['Status']
+            finally:
+                self.stopService(service)
+        else:
+            self.connect()
+            try:
+                self.startSession()
+                try:
+                    signature = open(imagePath + '.signature', 'rb').read()
+                    signature = CFDataCreate(None, signature, len(signature))
+                    items = 2
+
+                    keys = (ctypes.c_void_p * items)(CFStr('ImageSignature'), CFStr('ImageType'))
+                    values = (ctypes.c_void_p * items)(signature, CFStr('Developer'))
+
+                    options = CFDictionaryCreate(None, keys, values, items, ctypes.byref(kCFTypeDictionaryKeyCallBacks), ctypes.byref(kCFTypeDictionaryValueCallBacks))
+                    self._mountCallback = am_device_mount_image_callback(self._mount)
+                    e = AMDeviceMountImage(self._device, CFStr(imagePath), options, self._mountCallback, None)
+                    if e == 0:
+                        return True
+                    elif e  == 0xe8000076:
+                        # already mounted
+                        return False
+                    else:
+                        raise RuntimeError('AMDeviceMountImage returned %d' % e)
+                finally:
+                    self.stopSession()
+            finally:
+                self.disconnect()
 
     def startService(self, service):
         self.connect()
@@ -633,7 +723,7 @@ class MobileDeviceManager(object):
 
     def stopService(self, fd):
         if sys.platform == 'win32':
-            closesocket(fd)
+            ws2_32.closesocket(fd)
         else:
             os.close(fd)
 
@@ -692,6 +782,56 @@ class MobileDeviceManager(object):
             pass
         else:
             raise RuntimeError('Unexpected device notification status: %d' % info.msg)
+
+class AFCFile(object):
+    def __init__(self, afc, path, mode):
+        self._afc = afc
+        self._mode = 0
+        if 'r' in mode:
+            self._mode |= 1
+        if 'w' in mode:
+            self._mode |= 2
+        self._file = AFCFileRef()
+        self._open = False
+        result = AFCFileRefOpen(self._afc, path.encode('utf-8'), self._mode, 0, ctypes.byref(self._file))
+        if result != 0:
+            raise RuntimeError('AFCFileRefOpen returned %d' % result)
+        if not self._file:
+            raise RuntimeError('AFCFileRefOpen did not open a file')
+        self._open = True
+
+    def close(self):
+        if self._open:
+            result = AFCFileRefClose(self._afc, self._file)
+            if result != 0:
+                raise RuntimeError('AFCFileRefClose returned %d' % result)
+            self._open = False
+
+    def write(self, data):
+        length = ctypes.c_uint(len(data))
+        pointer = ctypes.c_char_p(data)
+        result = AFCFileRefWrite(self._afc, self._file, pointer, length)
+        if result != 0:
+            raise RuntimeError('AFCFileRefWrite returned %d' % result)
+
+class AFC(object):
+    def __init__(self, session):
+        self._session = session
+        self._afc = AFCConnectionRef()
+        result = AFCConnectionOpen(self._session, 0, ctypes.byref(self._afc))
+        if result != 0:
+            raise RuntimeError('AFCConnectionOpen returned %d' % result)
+
+    def open(self, path, mode):
+        return AFCFile(self._afc, path, mode)
+
+    def close(self):
+        AFCConnectionClose(self._afc)
+
+    def mkdir(self, path):
+        result = AFCDirectoryCreate(self._afc, path)
+        if result != 0:
+            raise RuntimeError('AFCDirectoryCreate returned %d' % result)
 
 class DeviceSupportPaths(object):
     """
@@ -864,6 +1004,8 @@ if __name__ == '__main__':
     parser.add_argument('-a', '--arguments', nargs=argparse.REMAINDER, help='arguments to pass to application being run')
     parser.add_argument('-t', '--timeout', type=float, help='seconds to wait for slow operations before giving up')
 
+    parser.add_argument('-ddi', '--developer-disk-image', type=str, help='path to DeveloperDiskImage.dmg')
+
     arguments = parser.parse_args()
 
     if not arguments.install and not arguments.uninstall and not arguments.run and not arguments.list_applications and not arguments.mount:
@@ -897,7 +1039,10 @@ if __name__ == '__main__':
             print bundleId
 
     if arguments.mount:
-        ddi = DeviceSupportPaths('iPhoneOS', mdm.productVersion(), mdm.buildVersion()).developerDiskImagePath()
+        if arguments.developer_disk_image:
+            ddi = arguments.developer_disk_image
+        else:
+            ddi = DeviceSupportPaths('iPhoneOS', mdm.productVersion(), mdm.buildVersion()).developerDiskImagePath()
         print '\nMounting %s...' % ddi
         mdm.mountImage(ddi)
 
