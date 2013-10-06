@@ -64,6 +64,7 @@ import time
 # CoreFoundation.framework
 
 if sys.platform == 'win32':
+    os.environ['PATH'] += os.pathsep + os.path.join(os.environ['CommonProgramFiles'], 'Apple', 'Apple Application Support')
     CoreFoundation = ctypes.CDLL('CoreFoundation.dll')
 else:
     CoreFoundation = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
@@ -229,6 +230,7 @@ def CFToPython(dataRef):
 # MobileDevice.Framework
 
 if sys.platform == 'win32':
+    os.environ['PATH'] += os.pathsep + os.path.join(os.environ['CommonProgramFiles'], 'Apple', 'Mobile Device Support')
     MobileDevice = ctypes.CDLL('MobileDevice.dll')
 else:
     MobileDevice = ctypes.CDLL('/System/Library/PrivateFrameworks/MobileDevice.framework/MobileDevice')
