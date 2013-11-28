@@ -332,6 +332,10 @@ AMDeviceStartService = MobileDevice.AMDeviceStartService
 AMDeviceStartService.argtypes = [am_device_p, CFStringRef, ctypes.POINTER(ctypes.c_int), ctypes.c_void_p]
 AMDeviceStartService.restype = ctypes.c_uint
 
+AMDeviceStartHouseArrestService = MobileDevice.AMDeviceStartHouseArrestService
+AMDeviceStartHouseArrestService.argtypes = [am_device_p, CFStringRef, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_void_p]
+AMDeviceStartHouseArrestService.restype = ctypes.c_uint
+
 am_device_install_application_callback = ctypes.CFUNCTYPE(ctypes.c_uint, CFDictionaryRef, ctypes.c_void_p)
 
 AMDeviceTransferApplication = MobileDevice.AMDeviceTransferApplication
@@ -382,6 +386,20 @@ AFCFileRefClose.restype = ctypes.c_uint
 AFCDirectoryCreate = MobileDevice.AFCDirectoryCreate
 AFCDirectoryCreate.argtypes = [AFCConnectionRef, ctypes.c_char_p]
 AFCDirectoryCreate.restype = ctypes.c_uint
+
+AFCDirectoryRef = ctypes.c_void_p
+
+AFCDirectoryOpen = MobileDevice.AFCDirectoryOpen
+AFCDirectoryOpen.argtypes = [AFCConnectionRef, ctypes.c_char_p, ctypes.POINTER(AFCDirectoryRef)]
+AFCDirectoryOpen.restype = ctypes.c_uint
+
+AFCDirectoryRead = MobileDevice.AFCDirectoryRead
+AFCDirectoryRead.argtypes = [AFCConnectionRef, AFCDirectoryRef, ctypes.POINTER(ctypes.c_char_p)]
+AFCDirectoryRead.restype = ctypes.c_uint
+
+AFCDirectoryClose = MobileDevice.AFCDirectoryClose
+AFCDirectoryClose.argtypes = [AFCConnectionRef, AFCDirectoryRef]
+AFCDirectoryClose.restype = ctypes.c_uint
 
 # ws2_32.dll
 
@@ -490,6 +508,7 @@ class MobileDeviceManager(object):
 
     def __init__(self):
         self._device = None
+        self._waitForDeviceId = None
         self._notification = None
 
         self._transferCallback = am_device_install_application_callback(self._transfer)
@@ -541,7 +560,8 @@ class MobileDeviceManager(object):
         if e != 0:
             raise RuntimeError('AMDeviceStopSession returned %d' % e)
 
-    def waitForDevice(self, timeout=0):
+    def waitForDevice(self, timeout=0, device=None):
+        self._waitForDeviceId = device
         self._notification = ctypes.c_void_p()
         self._notificationCallback = am_device_notification_callback(self._deviceNotification)
         e = AMDeviceNotificationSubscribe(self._notificationCallback, 0, 0, 0, ctypes.byref(self._notification))
@@ -649,6 +669,21 @@ class MobileDeviceManager(object):
                 e = AMDeviceStartService(self._device, CFStr(service), ctypes.byref(fd), None)
                 if e != 0:
                     raise RuntimeError('AMDeviceStartService returned %d' % e)
+                return fd.value
+            finally:
+                self.stopSession()
+        finally:
+            self.disconnect()
+
+    def startHouseArrestService(self, bundleId):
+        self.connect()
+        try:
+            self.startSession()
+            try:
+                fd = ctypes.c_int()
+                e = AMDeviceStartHouseArrestService(self._device, CFStr(bundleId), None, ctypes.byref(fd), None)
+                if e != 0:
+                    raise RuntimeError('AMDeviceStartHouseArrestService returned %d' % e)
                 return fd.value
             finally:
                 self.stopSession()
@@ -773,8 +808,9 @@ class MobileDeviceManager(object):
     def _deviceNotification(self, info, user):
         info = info.contents
         if info.msg == ADNCI_MSG_CONNECTED:
-            self._device = ctypes.c_void_p(info.dev)
-            CFRunLoopStop(CFRunLoopGetCurrent())
+            if self._waitForDeviceId is None or self._waitForDeviceId == CFStringGetStr(AMDeviceCopyDeviceIdentifier(ctypes.c_void_p(info.dev))):
+                self._device = ctypes.c_void_p(info.dev)
+                CFRunLoopStop(CFRunLoopGetCurrent())
         elif info.msg == ADNCI_MSG_DISCONNECTED:
             self._device = None
         elif info.msg == ADNCI_MSG_UNKNOWN:
@@ -807,6 +843,14 @@ class AFCFile(object):
                 raise RuntimeError('AFCFileRefClose returned %d' % result)
             self._open = False
 
+    def read(self, length):
+        readLength = ctypes.c_uint32(length)
+        data = (ctypes.c_char * length)()
+        result = AFCFileRefRead(self._afc, self._file, data, ctypes.byref(readLength))
+        if result != 0:
+            raise RuntimeError('AFCFileRefRead returned %d' % result)
+        return data.raw[:readLength.value]
+
     def write(self, data):
         length = ctypes.c_uint(len(data))
         pointer = ctypes.c_char_p(data)
@@ -832,6 +876,22 @@ class AFC(object):
         result = AFCDirectoryCreate(self._afc, path)
         if result != 0:
             raise RuntimeError('AFCDirectoryCreate returned %d' % result)
+
+    def listdir(self, path):
+        directory = AFCDirectoryRef()
+        result = AFCDirectoryOpen(self._afc, path.encode('utf-8'), ctypes.byref(directory))
+        if result != 0:
+            raise OSError('AFCDirectoryOpen returned %d' % result)
+        name = ctypes.c_char_p()
+        entries = []
+        while AFCDirectoryRead(self._afc, directory, ctypes.byref(name)) == 0:
+            if name.value is None:
+                break
+            path = name.value.decode('utf-8')
+            if not path in ('.', '..'):
+                entries.append(path)
+        AFCDirectoryClose(self._afc, directory)
+        return entries
 
 class DeviceSupportPaths(object):
     """
@@ -993,28 +1053,49 @@ class GdbServer(object):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Manage and launch applications on iOS.')
-    parser.add_argument('-i', '--install', action='store_true', help='install an application')
-    parser.add_argument('-r', '--run', action='store_true', help='run an application')
-    parser.add_argument('-u', '--uninstall', action='store_true', help='uninstall an application')
-    parser.add_argument('-m', '--mount', action='store_true', help='mount developer disk image (must be done at least once to run, not supported on Windows)')
-    parser.add_argument('-l', '--list-applications', action='store_true', help='list installed applications')
 
-    parser.add_argument('-b', '--bundle', help='path to local app bundle [to install]')
-    parser.add_argument('-id', '--appid', help='application identifier [to run or uninstall]')
-    parser.add_argument('-a', '--arguments', nargs=argparse.REMAINDER, help='arguments to pass to application being run')
-    parser.add_argument('-t', '--timeout', type=float, help='seconds to wait for slow operations before giving up')
+    group = parser.add_argument_group('Global Configuration')
+    group.add_argument('-b', '--bundle', help='path to local app bundle to operate on')
+    group.add_argument('-id', '--appid', help='application identifier to operate on')
+    group.add_argument('-t', '--timeout', type=float, help='seconds to wait for slow operations before giving up')
+    group.add_argument('-dev', '--device-id', help='device id of specific device to communicate with')
 
-    parser.add_argument('-ddi', '--developer-disk-image', type=str, help='path to DeveloperDiskImage.dmg')
+    group = parser.add_argument_group('Application Management')
+    group.add_argument('-i', '--install', action='store_true', help='install an application')
+    group.add_argument('-u', '--uninstall', action='store_true', help='uninstall an application')
+    group.add_argument('-l', '--list-applications', action='store_true', help='list installed applications')
+
+    group.add_argument('-r', '--run', action='store_true', help='run an application')
+    group.add_argument('-a', '--arguments', nargs=argparse.REMAINDER, help='arguments to pass to application being run')
+
+    group = parser.add_argument_group('Developer Disk Image')
+    group.add_argument('-m', '--mount', action='store_true', help='mount developer disk image (must be done at least once to run)')
+    group.add_argument('-ddi', '--developer-disk-image', type=str, help='path to DeveloperDiskImage.dmg')
+
+    group = parser.add_argument_group('File Access')
+    group.add_argument('-get', '--get-file', nargs=2, metavar=('DEVICE_FILE', 'LOCAL_FILE'), help='read a file from the device')
+    group.add_argument('-put', '--put-file', nargs=2, metavar=('LOCAL_FILE', 'DEVICE_FILE'), help='write a file to the device')
+    group.add_argument('-ls', '--list-files', nargs='?', metavar='PATH', const='.', help='recursively list all files and directories, starting at the root or given path')
 
     arguments = parser.parse_args()
 
-    if not arguments.install and not arguments.uninstall and not arguments.run and not arguments.list_applications and not arguments.mount:
+    if not arguments.install \
+        and not arguments.uninstall \
+        and not arguments.run \
+        and not arguments.list_applications \
+        and not arguments.mount \
+        and not arguments.get_file \
+        and not arguments.put_file \
+        and not arguments.list_files:
         print 'Nothing to do.'
         sys.exit(0)
 
     mdm = MobileDeviceManager()
-    print 'Waiting for a device...'
-    if not mdm.waitForDevice(timeout=arguments.timeout):
+    if arguments.device_id:
+        print 'Waiting for a device with UDID %s...' % arguments.device_id
+    else:
+        print 'Waiting for a device...'
+    if not mdm.waitForDevice(timeout=arguments.timeout, device=arguments.device_id):
         print 'Gave up waiting for a device.'
         sys.exit(1)
 
@@ -1062,4 +1143,50 @@ if __name__ == '__main__':
             print e
             sys.exit(1)
         sys.exit(debugger.exitCode)
+
+    if arguments.get_file or arguments.put_file or arguments.list_files:
+        if arguments.appid or arguments.bundle:
+            afc = AFC(mdm.startHouseArrestService(arguments.appid or mdm.bundleId(arguments.bundle)))
+        else:
+            afc = AFC(mdm.startService('com.apple.afc'))
+
+        if arguments.get_file:
+            readFile = afc.open(arguments.get_file[0], 'r')
+            writeFile = open(arguments.get_file[1], 'wb')
+            size = 0
+            while True:
+                data = readFile.read(8192)
+                if not data:
+                    break
+                writeFile.write(data)
+                size += len(data)
+            writeFile.close()
+            readFile.close()
+            print '%d bytes read from %s.' % (size, arguments.get_file[0])
+        elif arguments.put_file:
+            readFile = open(arguments.put_file[0], 'rb')
+            writeFile = afc.open(arguments.put_file[1], 'w')
+            size = 0
+            while True:
+                data = readFile.read(8192)
+                if not data:
+                    break
+                writeFile.write(data)
+                size += len(data)
+            writeFile.close()
+            readFile.close()
+            print '%d bytes written to %s.' % (size, arguments.put_file[1])
+        elif arguments.list_files:
+            print 'Listing %s:' % arguments.list_files
+            def walk(root, indent=0):
+                print '  ' * indent + root
+                try:
+                    children = afc.listdir(root)
+                except:
+                    children = []
+                for child in children:
+                    walk(root.rstrip('/') + '/' + child, indent + 1)
+            walk(arguments.list_files)
+        afc.close()
+
     mdm.close()
