@@ -599,40 +599,51 @@ class MobileDeviceManager(object):
 
     def mountImage(self, imagePath):
         if sys.platform == 'win32':
-            # AMDeviceMountImage isn't exported in MobileDevice.dll grumble grumble.
-            service = self.startService('com.apple.afc')
+            imageMounterService = self.startService('com.apple.mobile.mobile_image_mounter')
             try:
-                afc = AFC(service)
-                try:
-                    afc.mkdir('PublicStaging')
-                    target = afc.open('PublicStaging/staging.dimage', 'w')
-                    with open(imagePath, 'rb') as source:
-                        while True:
-                            data = source.read(8192)
-                            if data:
-                                target.write(data)
-                            else:
-                                break
-                    target.close()
-                finally:
-                    afc.close()
-            finally:
-                self.stopService(service)
-            service = self.startService('com.apple.mobile.mobile_image_mounter')
-            try:
-                raw = RawPlistService(service)
+                # AMDeviceMountImage isn't exported in MobileDevice.dll grumble grumble.
+                raw = RawPlistService(imageMounterService)
+
+                result = raw.exchange({
+                    'Command': 'ReceiveBytes',
+                    'ImageSize': os.stat(imagePath).st_size,
+                    'ImageType': 'Developer',
+                })
+                if result.get('Status') == 'ReceiveBytesAck':
+                    # Only supported by iOS 7 and up?
+                    raw._socket.sendall(open(imagePath, 'rb').read())
+                else:
+                    service = self.startService('com.apple.afc')
+                    try:
+                        afc = AFC(service)
+                        try:
+                            afc.mkdir('PublicStaging')
+                            target = afc.open('PublicStaging/staging.dimage', 'w')
+                            with open(imagePath, 'rb') as source:
+                                while True:
+                                    data = source.read(8192)
+                                    if data:
+                                        target.write(data)
+                                    else:
+                                        break
+                            target.close()
+                        finally:
+                            afc.close()
+                    finally:
+                        self.stopService(service)
+
                 result = raw.exchange({
                     'Command': 'MountImage',
                     'ImageType': 'Developer',
                     'ImageSignature': plistlib.Data(open(imagePath + '.signature', 'rb').read()),
-                    'ImagePath': '/private/var/mobile/Media/PublicStaging/staging.dimage',
+                    'ImagePath': '/var/mobile/Media/PublicStaging/staging.dimage',
                 })
                 if 'Error' in result:
                     print 'MountImage returned', result['Error']
                 if 'Status' in result:
                     print 'MountImage =>', result['Status']
             finally:
-                self.stopService(service)
+                self.stopService(imageMounterService)
         else:
             self.connect()
             try:
