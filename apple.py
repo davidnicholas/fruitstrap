@@ -608,6 +608,7 @@ class MobileDeviceManager(object):
                     'Command': 'ReceiveBytes',
                     'ImageSize': os.stat(imagePath).st_size,
                     'ImageType': 'Developer',
+                    'ImageSignature': plistlib.Data(open(imagePath + '.signature', 'rb').read()),
                 })
                 if result.get('Status') == 'ReceiveBytesAck':
                     # Only supported by iOS 7 and up?
