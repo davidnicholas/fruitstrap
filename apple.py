@@ -357,7 +357,7 @@ AMDeviceLookupApplications.restype = ctypes.c_uint
 # AFC
 
 AFCConnectionRef = ctypes.c_void_p
-AFCFileRef = ctypes.c_uint64
+AFCFileRef = ctypes.c_ulonglong
 
 AFCConnectionOpen = MobileDevice.AFCConnectionOpen
 AFCConnectionOpen.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.POINTER(AFCConnectionRef)]
@@ -368,7 +368,7 @@ AFCConnectionClose.argtypes = [AFCConnectionRef]
 AFCConnectionClose.restype = ctypes.c_uint
 
 AFCFileRefOpen = MobileDevice.AFCFileRefOpen
-AFCFileRefOpen.argtypes = [AFCConnectionRef, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(AFCFileRef)]
+AFCFileRefOpen.argtypes = [AFCConnectionRef, ctypes.c_char_p, ctypes.c_ulonglong, ctypes.POINTER(AFCFileRef)]
 AFCFileRefOpen.restype = ctypes.c_uint
 
 AFCFileRefRead = MobileDevice.AFCFileRefRead
@@ -386,6 +386,10 @@ AFCFileRefClose.restype = ctypes.c_uint
 AFCDirectoryCreate = MobileDevice.AFCDirectoryCreate
 AFCDirectoryCreate.argtypes = [AFCConnectionRef, ctypes.c_char_p]
 AFCDirectoryCreate.restype = ctypes.c_uint
+
+AFCRemovePath = MobileDevice.AFCRemovePath
+AFCRemovePath.argtypes = [AFCConnectionRef, ctypes.c_char_p]
+AFCRemovePath.restype = ctypes.c_uint
 
 AFCDirectoryRef = ctypes.c_void_p
 
@@ -720,7 +724,7 @@ class MobileDeviceManager(object):
             self.stopService(afc)
 
     def installApplication(self, path):
-        afc = mdm.startService("com.apple.mobile.installation_proxy")
+        afc = self.startService("com.apple.mobile.installation_proxy")
         try:
 
             items = 1
@@ -733,7 +737,7 @@ class MobileDeviceManager(object):
             if e != 0:
                 raise RuntimeError('AMDeviceInstallApplication returned %d' % e)
         finally:
-            mdm.stopService(afc)
+            self.stopService(afc)
 
     def uninstallApplication(self, bundleId):
         afc = self.startService("com.apple.mobile.installation_proxy")
@@ -834,14 +838,23 @@ class MobileDeviceManager(object):
 class AFCFile(object):
     def __init__(self, afc, path, mode):
         self._afc = afc
-        self._mode = 0
+        self._mode = ctypes.c_ulonglong(0)
+        # http://www.hydrogenaud.io/forums/index.php?showtopic=45160&st=890
+        # mode 1 = read
+        # mode 2 = read + write
+        # mode 3 = write new
+        # mode 4 = write new + read
+        # mode 5 = write
+        # mode 6 = read + write
+        # MobileDevice.h: mode 2 = read, mode 3 = write 
         if 'r' in mode:
-            self._mode |= 1
+            self._mode.value |= 1
         if 'w' in mode:
-            self._mode |= 2
+            self._mode.value |= 3
         self._file = AFCFileRef()
         self._open = False
-        result = AFCFileRefOpen(self._afc, path.encode('utf-8'), self._mode, 0, ctypes.byref(self._file))
+
+        result = AFCFileRefOpen(self._afc, path.encode('utf-8'), self._mode, ctypes.byref(self._file))
         if result != 0:
             raise RuntimeError('AFCFileRefOpen returned %d' % result)
         if not self._file:
@@ -871,6 +884,22 @@ class AFCFile(object):
             raise RuntimeError('AFCFileRefWrite returned %d' % result)
 
 class AFC(object):
+    '''
+    Error codes
+         7 Bad arguments
+         8 Permission denied (no read access), or file not found
+        10 Permission denied (no write access)
+    (from fruitstrap::MobileDevice.h)
+         1 syscall
+         3 out of mmory
+         4 query failed
+        11 invalid argument
+        37 dict not loaded (0x25)
+        22 arg null
+        See also
+        https://www.theiphonewiki.com/wiki/MobileDevice_Library#Known_Error_Codes
+    '''
+
     def __init__(self, session):
         self._session = session
         self._afc = AFCConnectionRef()
@@ -884,10 +913,17 @@ class AFC(object):
     def close(self):
         AFCConnectionClose(self._afc)
 
+    # Top level directory seems write protected, so create under
+    # Documents/ or tmp/
     def mkdir(self, path):
         result = AFCDirectoryCreate(self._afc, path)
         if result != 0:
             raise RuntimeError('AFCDirectoryCreate returned %d' % result)
+
+    def remove_path(self, path):
+        result = AFCRemovePath(self._afc, path)
+        if result != 0:
+            raise RuntimeError('AFCRemovePath %s returned %d' % (path, result))
 
     def listdir(self, path):
         directory = AFCDirectoryRef()
@@ -1027,7 +1063,7 @@ class GdbServer(object):
                 if response:
                     if response.startswith('S'):
                         signal = '0x' + response[1:3]
-                        message = 'Program received signal %s.' % signal
+                        message = 'Program received signal %s. (registers unavailable)' % signal
                         raise DebuggerException(message)
                     elif response.startswith('T'):
                         signal = '0x' + response[1:3]
@@ -1037,7 +1073,8 @@ class GdbServer(object):
                         raise DebuggerException(message)
                     elif response.startswith('W'):
                         self.exitCode = int(response[1:], 16)
-                        print 'Process returned %d.' % self.exitCode
+                        if self.exitCode != 0 :
+                            print 'Process returned %d.' % self.exitCode
                     elif response.startswith('X'):
                         signal = '0x' + response[1:3]
                         if ';' in response:
@@ -1062,6 +1099,9 @@ class GdbServer(object):
         self.send('A' + ','.join('%d,%d,%s' % (len(arg) * 2, i, arg.encode('hex')) for i, arg in enumerate(argv)))
         self.send('qLaunchSuccess')
         self.send('vCont;c')
+
+    def kill(self):
+        self.send('k')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Manage and launch applications on iOS.')
@@ -1202,3 +1242,4 @@ if __name__ == '__main__':
         afc.close()
 
     mdm.close()
+
